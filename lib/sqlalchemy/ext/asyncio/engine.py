@@ -186,6 +186,33 @@ class AsyncConnectable:
         "default_isolation_level",
     ],
 )
+class _AsyncExecutionOptionsFrame:
+    """An asyncio proxy for a synchronous
+    :class:`_engine._ExecutionOptionsFrame`.
+
+    All state remains on the synchronous :class:`_engine.Connection`
+    stack; this object only bridges push/pop through the greenlet
+    adapter, so no second, independently maintained options stack
+    exists in the async layer.
+
+    """
+
+    __slots__ = ("connection", "sync_frame")
+
+    def __init__(self, connection: "AsyncConnection", sync_frame: Any):
+        self.connection = connection
+        self.sync_frame = sync_frame
+
+    async def __aenter__(self) -> "_AsyncExecutionOptionsFrame":
+        return self
+
+    async def __aexit__(
+        self, type_: Any, value: Any, traceback: Any
+    ) -> None:
+        # pop even if the body raised
+        await self.connection.pop_execution_options(self)
+
+
 class AsyncConnection(
     ProxyComparable[Connection],
     StartableContext["AsyncConnection"],
@@ -440,6 +467,80 @@ class AsyncConnection(
         c2 = await greenlet_spawn(conn.execution_options, **opt)
         assert c2 is conn
         return self
+
+    @overload
+    async def push_execution_options(
+        self,
+        *,
+        compiled_cache: Optional[CompiledCacheType] = ...,
+        logging_token: str = ...,
+        isolation_level: IsolationLevel = ...,
+        no_parameters: bool = False,
+        stream_results: bool = False,
+        max_row_buffer: int = ...,
+        yield_per: int = ...,
+        insertmanyvalues_page_size: int = ...,
+        schema_translate_map: Optional[SchemaTranslateMapType] = ...,
+        preserve_rowcount: bool = False,
+        **opt: Any,
+    ) -> _AsyncExecutionOptionsFrame: ...
+
+    @overload
+    async def push_execution_options(
+        self, **opt: Any
+    ) -> _AsyncExecutionOptionsFrame: ...
+
+    async def push_execution_options(
+        self, **opt: Any
+    ) -> _AsyncExecutionOptionsFrame:
+        r"""Push a nested layer of execution options onto this
+        :class:`_asyncio.AsyncConnection`.
+
+        Async counterpart of
+        :meth:`_engine.Connection.push_execution_options`.  The frame is
+        maintained entirely by the proxied synchronous
+        :class:`_engine.Connection`; this method only bridges through
+        the greenlet adapter, so synchronous and asynchronous callers
+        observe one shared stack.
+
+        The returned frame is an async context manager that pops itself
+        on exit, including when the block raises::
+
+            async with await connection.push_execution_options(
+                isolation_level="SERIALIZABLE"
+            ):
+                await connection.execute(...)
+
+        .. seealso::
+
+            :meth:`_engine.Connection.push_execution_options`
+
+            :meth:`_asyncio.AsyncConnection.pop_execution_options`
+
+        """
+
+        sync_frame = await greenlet_spawn(
+            self._proxied.push_execution_options, **opt
+        )
+        return _AsyncExecutionOptionsFrame(self, sync_frame)
+
+    async def pop_execution_options(
+        self,
+        frame: Optional[_AsyncExecutionOptionsFrame] = None,
+    ) -> None:
+        """Pop a frame previously pushed using
+        :meth:`_asyncio.AsyncConnection.push_execution_options`.
+
+        Bridges to :meth:`_engine.Connection.pop_execution_options` on
+        the proxied synchronous connection; no independent option stack
+        is maintained asynchronously.
+
+        """
+
+        sync_frame = frame.sync_frame if frame is not None else None
+        await greenlet_spawn(
+            self._proxied.pop_execution_options, sync_frame
+        )
 
     async def commit(self) -> None:
         """Commit the transaction that is currently in progress.

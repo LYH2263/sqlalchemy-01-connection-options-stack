@@ -84,6 +84,58 @@ _EMPTY_EXECUTION_OPTS: _ExecuteOptions = util.EMPTY_DICT
 NO_OPTIONS: Mapping[str, Any] = util.EMPTY_DICT
 
 
+class _ExecutionOptionsFrame:
+    """A single layer of the nested execution-options strategy stack on a
+    :class:`_engine.Connection`.
+
+    A frame is created by
+    :meth:`_engine.Connection.push_execution_options`; it remembers the
+    merged execution-options view of the outer layer together with the
+    registered characteristic values that have to be restored when the
+    frame is popped.
+
+    The frame is itself a context manager so that popping also takes
+    place if the enclosed block raises::
+
+        with connection.push_execution_options(isolation_level="SERIALIZABLE"):
+            connection.execute(...)
+
+    """
+
+    __slots__ = (
+        "connection",
+        "previous_execution_options",
+        "characteristic_restore",
+        "checkin_finalizer",
+        "dbapi_connection",
+        "popped",
+    )
+
+    def __init__(
+        self,
+        connection: "Connection",
+        previous_execution_options: _ExecuteOptions,
+        characteristic_restore: List[Tuple[Any, Any, Any]],
+        checkin_finalizer: Optional[Callable[[Any], None]],
+        dbapi_connection: Optional[PoolProxiedConnection],
+    ):
+        self.connection = connection
+        self.previous_execution_options = previous_execution_options
+        self.characteristic_restore = characteristic_restore
+        self.checkin_finalizer = checkin_finalizer
+        self.dbapi_connection = dbapi_connection
+        self.popped = False
+
+    def __enter__(self) -> "_ExecutionOptionsFrame":
+        return self
+
+    def __exit__(self, type_: Any, value: Any, traceback: Any) -> None:
+        # pop even if the body raised; a frame already popped explicitly
+        # via Connection.pop_execution_options() is not popped twice
+        if not self.popped:
+            self.connection._pop_execution_options(self)
+
+
 class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
     """Provides high-level functionality for a wrapped DB-API connection.
 
@@ -170,6 +222,13 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         )
 
         self._execution_options = engine._execution_options
+
+        # nested execution-options frame stack, managed by
+        # push_execution_options()/pop_execution_options(); while empty,
+        # execution-options behavior is identical to that of a Connection
+        # without a stack.  _execution_options always reflects the merged
+        # view of the stack top.
+        self._execution_options_stack: List[_ExecutionOptionsFrame] = []
 
         if self._has_events or self.engine._has_events:
             self.dispatch.engine_connect(self)
@@ -521,13 +580,269 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
     def get_execution_options(self) -> _ExecuteOptions:
         """Get the non-SQL options which will take effect during execution.
 
+        When execution-options frames have been pushed using
+        :meth:`_engine.Connection.push_execution_options`, the returned
+        mapping is the merged view of the current stack top.
+
         .. versionadded:: 1.3
 
         .. seealso::
 
             :meth:`_engine.Connection.execution_options`
+
+            :meth:`_engine.Connection.push_execution_options`
         """
         return self._execution_options
+
+    @overload
+    def push_execution_options(
+        self,
+        *,
+        compiled_cache: Optional[CompiledCacheType] = ...,
+        logging_token: str = ...,
+        isolation_level: IsolationLevel = ...,
+        no_parameters: bool = False,
+        stream_results: bool = False,
+        max_row_buffer: int = ...,
+        yield_per: int = ...,
+        insertmanyvalues_page_size: int = ...,
+        schema_translate_map: Optional[SchemaTranslateMapType] = ...,
+        preserve_rowcount: bool = False,
+        **opt: Any,
+    ) -> _ExecutionOptionsFrame: ...
+
+    @overload
+    def push_execution_options(
+        self, **opt: Any
+    ) -> _ExecutionOptionsFrame: ...
+
+    def push_execution_options(self, **opt: Any) -> _ExecutionOptionsFrame:
+        r"""Push a new, nested layer of execution options onto this
+        :class:`_engine.Connection`.
+
+        This method is the nestable counterpart of
+        :meth:`_engine.Connection.execution_options`.  Whereas
+        :meth:`_engine.Connection.execution_options` unions the given
+        options into the connection state for the remainder of the
+        checkout (reset by the connection pool to the dialect default
+        only when the DBAPI connection is checked back in), a frame
+        pushed here can be popped again to restore the exact execution
+        options that were in effect at the outer layer::
+
+            with connection.push_execution_options(
+                isolation_level="SERIALIZABLE"
+            ):
+                connection.execute(...)
+            # isolation level is back at the outer-layer value here
+
+        Frames may be nested arbitrarily.  The effective options, as
+        returned by :meth:`_engine.Connection.get_execution_options` or
+        read internally for statement execution, compilation and
+        ``schema_for_object()``, are always the merged view of the
+        current stack top; each new layer unions its options on top of
+        the outer view.  Options that only affect result fetching, such
+        as ``stream_results``, ``max_row_buffer`` and ``yield_per``, as
+        well as user defined option names that are not registered as
+        dialect characteristics, are part of that merged view and need
+        no DBAPI reset.
+
+        The returned object is both a frame handle and a context
+        manager.  The three supported forms are:
+
+        * ``frame = connection.push_execution_options(**opt)`` pushes a
+          frame;
+        * ``connection.pop_execution_options(frame)`` pops it again;
+        * ``with connection.push_execution_options(**opt):`` pops the
+          frame on block exit, including when the block raises.
+
+        Registered :class:`.ConnectionCharacteristic` options such as
+        ``isolation_level`` and ``logging_token`` are applied as the
+        frame is pushed.  Popping a frame does **not** reset them to a
+        dialect or on-connect default; instead, the outer layer's value
+        in effect when the frame was pushed is restored (using the
+        dialect DBAPI for ``isolation_level``, and connection-side
+        formatting state for ``logging_token``).  The existing
+        transactional constraint is unchanged: a transactional
+        characteristic like ``isolation_level`` can neither be changed
+        nor restored while a transaction is in progress, so the frame
+        has to be popped outside of the transaction, e.g. after
+        ``commit()`` / ``rollback()``.
+
+        The rules at the different exits are deliberately separate:
+
+        * **normal pop** via :meth:`pop_execution_options` or the
+          context manager restores the outer user options on the same
+          DBAPI connection;
+        * **connection pool checkin** with frames still present keeps
+          today's behavior - a finalizer registered by each frame runs
+          the existing characteristic reset to the dialect default
+          while the DBAPI connection returns to the pool.  When every
+          frame was popped, checkin is unchanged from a Connection that
+          never used the stack;
+        * **invalidation** of the DBAPI connection does not replay
+          DBAPI-bound characteristics onto the replacement connection,
+          and pending frames are not re-applied there; connection-local
+          state (such as ``logging_token``) is still restored on pop.
+
+        Calling the in-place :meth:`_engine.Connection.execution_options`
+        while a frame is active unions those options into the current
+        stack top; popping the frame restores the outer view.  A
+        characteristic changed by such an in-place call still follows
+        the in-place contract and is reset by the connection pool at
+        checkin independently of the frame.
+
+        This facility is independent of
+        :meth:`_engine.Engine.execution_options` (which continues to
+        return a shallow-copy :class:`.OptionEngine` sharing the pool)
+        and of the ORM :meth:`.Session.no_autoflush` context.
+
+        :param \**opt: options accepted by
+         :meth:`_engine.Connection.execution_options`.
+
+        .. seealso::
+
+            :meth:`_engine.Connection.pop_execution_options`
+
+            :meth:`_engine.Connection.execution_options`
+
+        """
+        if self._has_events or self.engine._has_events:
+            self.dispatch.set_connection_execution_options(self, opt)
+
+        previous_execution_options = self._execution_options
+
+        # applies registered characteristics, captures outer values for
+        # restore and registers the pool-checkin finalizer; may raise
+        # (e.g. transactional characteristic in an active transaction)
+        # before any Connection state is changed
+        characteristic_restore, checkin_finalizer = (
+            self.dialect.push_connection_execution_options(
+                self, opt, previous_execution_options
+            )
+        )
+
+        frame = _ExecutionOptionsFrame(
+            self,
+            previous_execution_options,
+            characteristic_restore,
+            checkin_finalizer,
+            self._dbapi_connection,
+        )
+
+        self._execution_options = previous_execution_options.union(opt)
+        self._execution_options_stack.append(frame)
+        return frame
+
+    def pop_execution_options(
+        self, frame: Optional[_ExecutionOptionsFrame] = None
+    ) -> None:
+        """Pop a frame previously pushed using
+        :meth:`_engine.Connection.push_execution_options`.
+
+        :param frame: the frame returned by
+         :meth:`_engine.Connection.push_execution_options`.  If omitted,
+         the current top frame is popped.  Frames must be popped in
+         reverse order of pushing.
+
+        Popping restores the execution options of the outer layer, as
+        well as the registered characteristic values in effect when the
+        popped frame was pushed.  See
+        :meth:`_engine.Connection.push_execution_options` for the
+        behavior at each kind of exit (normal pop, pool checkin and
+        invalidation).
+
+        .. seealso::
+
+            :meth:`_engine.Connection.push_execution_options`
+
+        """
+        stack = self._execution_options_stack
+
+        if frame is None:
+            if not stack:
+                raise exc.InvalidRequestError(
+                    "This Connection has no execution options frame to "
+                    "pop; pop_execution_options() requires a frame "
+                    "returned by push_execution_options()."
+                )
+            frame = stack[-1]
+        elif not stack or frame is not stack[-1]:
+            if frame.popped:
+                raise exc.InvalidRequestError(
+                    "This execution options frame has already been "
+                    "popped."
+                )
+            raise exc.InvalidRequestError(
+                "Execution options frames must be popped in the reverse "
+                "order in which they were pushed."
+            )
+
+        self._pop_execution_options(frame)
+
+    def _pop_execution_options(self, frame: _ExecutionOptionsFrame) -> None:
+        # EXIT 1/3 dispatcher for a user-initiated pop.  The pool
+        # checkin exit (EXIT 2) does not run through here; frame
+        # finalizers registered on the connection record are invoked by
+        # the pool itself and reset to the dialect default.
+        same_dbapi_connection = (
+            self._dbapi_connection is frame.dbapi_connection
+        )
+
+        if (
+            same_dbapi_connection
+            and self._still_open_and_dbapi_connection_is_valid
+        ):
+            # EXIT 1 - normal pop on the still checked-out, valid DBAPI
+            # connection: restore the outer user values through the
+            # dialect.  This raises (e.g. for a transactional
+            # characteristic inside a transaction) before any state is
+            # changed, so the frame can still be popped after the
+            # transaction is rolled back or committed.
+            self.dialect.pop_connection_execution_options(
+                self, frame.characteristic_restore
+            )
+        else:
+            # EXIT 3 - the DBAPI connection was invalidated (or the
+            # Connection was closed) between push and pop.  Do not
+            # replay DBAPI-bound characteristics onto the dead or
+            # replacement connection; restore connection-local
+            # characteristics only.
+            for (
+                _,
+                characteristic,
+                outer_value,
+            ) in frame.characteristic_restore:
+                if characteristic.connection_local:
+                    characteristic.set_connection_characteristic(
+                        self.dialect,
+                        self,
+                        self._dbapi_connection,
+                        outer_value,
+                    )
+
+        frame.popped = True
+        self._execution_options_stack.pop()
+        self._execution_options = frame.previous_execution_options
+
+        # detach this frame's checkin finalizer; it is only needed if
+        # the frame survives until pool checkin.  After an invalidation
+        # the record's finalizer collection has already been discarded
+        # by the pool, so it is not touched in that case.
+        checkin_finalizer = frame.checkin_finalizer
+        if checkin_finalizer is not None and same_dbapi_connection:
+            pool_proxied_connection = self._dbapi_connection
+            if pool_proxied_connection is not None:
+                connection_record = cast(
+                    "_ConnectionFairy", pool_proxied_connection
+                )._connection_record
+                if connection_record is not None:
+                    try:
+                        connection_record.finalize_callback.remove(
+                            checkin_finalizer
+                        )
+                    except ValueError:
+                        # already discarded (e.g. recycle/invalidate)
+                        pass
 
     @property
     def _still_open_and_dbapi_connection_is_valid(self) -> bool:

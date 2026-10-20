@@ -4241,3 +4241,507 @@ class DialectDoesntSupportCachingTest(fixtures.TestBase):
                 (2,),
             ],
         )
+
+
+class ExecutionOptionsStackTest(fixtures.TestBase):
+    """Nested execution options stack on Connection.
+
+    Uses ad-hoc sqlite engines; isolation level assertions rely on the
+    pysqlite PRAGMA based levels (SERIALIZABLE default, READ UNCOMMITTED).
+
+    """
+
+    __requires__ = ("ad_hoc_engines",)
+
+    def _engine(self, **kw):
+        return create_engine("sqlite://", **kw)
+
+    def test_unstacked_behavior_unchanged(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            is_(conn.get_execution_options(), conn._execution_options)
+            eq_(conn._execution_options_stack, [])
+
+            conn.execution_options(isolation_level="READ UNCOMMITTED")
+            eq_(conn.get_isolation_level(), "READ UNCOMMITTED")
+        # pool checkin resets to the dialect default, as always
+        with eng.connect() as conn:
+            eq_(conn.get_isolation_level(), "SERIALIZABLE")
+
+    def test_push_pop_merged_view(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            frame = conn.push_execution_options(
+                custom_option="x", stream_results=True
+            )
+            is_(conn.get_execution_options(), conn._execution_options)
+            eq_(conn.get_execution_options()["custom_option"], "x")
+            is_(conn.get_execution_options()["stream_results"], True)
+            is_(conn._execution_options_stack[-1], frame)
+
+            conn.pop_execution_options(frame)
+            eq_(conn._execution_options_stack, [])
+            assert "custom_option" not in conn.get_execution_options()
+            assert "stream_results" not in conn.get_execution_options()
+
+    def test_nested_frames_merge_and_restore(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            outer = conn.push_execution_options(custom_option="outer", a=1)
+            eq_(conn.get_execution_options()["custom_option"], "outer")
+
+            inner = conn.push_execution_options(
+                custom_option="inner", b=2
+            )
+            opts = conn.get_execution_options()
+            eq_(opts["custom_option"], "inner")
+            eq_(opts["a"], 1)
+            eq_(opts["b"], 2)
+
+            conn.pop_execution_options(inner)
+            opts = conn.get_execution_options()
+            eq_(opts["custom_option"], "outer")
+            eq_(opts["a"], 1)
+            assert "b" not in opts
+
+            conn.pop_execution_options(outer)
+            opts = conn.get_execution_options()
+            assert "custom_option" not in opts
+            assert "a" not in opts
+
+    def test_context_manager_pops_on_exception(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            try:
+                with conn.push_execution_options(
+                    custom_option="x",
+                    isolation_level="READ UNCOMMITTED",
+                ):
+                    eq_(conn.get_isolation_level(), "READ UNCOMMITTED")
+                    raise RuntimeError("boom")
+            except RuntimeError:
+                pass
+            eq_(conn._execution_options_stack, [])
+            assert "custom_option" not in conn.get_execution_options()
+            eq_(conn.get_isolation_level(), "SERIALIZABLE")
+
+    def test_explicit_pop_inside_context_is_idempotent(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            frame = conn.push_execution_options(custom_option="x")
+            with frame:
+                conn.pop_execution_options()
+            eq_(conn._execution_options_stack, [])
+
+    def test_pop_empty_stack(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            assert_raises_message(
+                tsa.exc.InvalidRequestError,
+                "no execution options frame to pop",
+                conn.pop_execution_options,
+            )
+
+    def test_pop_out_of_order(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            outer = conn.push_execution_options(custom_option="outer")
+            inner = conn.push_execution_options(custom_option="inner")
+            assert_raises_message(
+                tsa.exc.InvalidRequestError,
+                "reverse order",
+                conn.pop_execution_options,
+                outer,
+            )
+            # stack is untouched
+            is_(conn._execution_options_stack[-1], inner)
+            conn.pop_execution_options(inner)
+            conn.pop_execution_options(outer)
+
+    def test_double_pop(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            frame = conn.push_execution_options(custom_option="x")
+            conn.pop_execution_options(frame)
+            assert_raises_message(
+                tsa.exc.InvalidRequestError,
+                "already been popped",
+                conn.pop_execution_options,
+                frame,
+            )
+
+    def test_isolation_level_restored_to_default(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            with conn.push_execution_options(
+                isolation_level="READ UNCOMMITTED"
+            ):
+                eq_(conn.get_isolation_level(), "READ UNCOMMITTED")
+            eq_(conn.get_isolation_level(), "SERIALIZABLE")
+
+    def test_isolation_level_restored_to_outer_user_value(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            # outer user value set with the existing in-place API - the
+            # frame must restore this, not the dialect default
+            conn.execution_options(isolation_level="READ UNCOMMITTED")
+            with conn.push_execution_options(isolation_level="SERIALIZABLE"):
+                eq_(conn.get_isolation_level(), "SERIALIZABLE")
+            eq_(conn.get_isolation_level(), "READ UNCOMMITTED")
+
+    def test_isolation_level_restored_to_engine_option_value(self):
+        eng = self._engine(
+            execution_options={"isolation_level": "READ UNCOMMITTED"}
+        )
+        with eng.connect() as conn:
+            eq_(conn.get_isolation_level(), "READ UNCOMMITTED")
+            with conn.push_execution_options(isolation_level="SERIALIZABLE"):
+                eq_(conn.get_isolation_level(), "SERIALIZABLE")
+            eq_(conn.get_isolation_level(), "READ UNCOMMITTED")
+
+    def test_push_rejected_inside_transaction(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            conn.execute(text("CREATE TABLE t (id INTEGER)"))
+            conn.execute(text("INSERT INTO t VALUES (1)"))  # autobegin
+            assert_raises_message(
+                tsa.exc.InvalidRequestError,
+                "isolation_level may not be altered",
+                conn.push_execution_options,
+                isolation_level="READ UNCOMMITTED",
+            )
+            # nothing was pushed, nothing was set
+            eq_(conn._execution_options_stack, [])
+            assert "isolation_level" not in conn.get_execution_options()
+            eq_(conn.get_isolation_level(), "SERIALIZABLE")
+            conn.rollback()
+
+    def test_pop_rejected_inside_transaction_then_retry(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            frame = conn.push_execution_options(
+                isolation_level="READ UNCOMMITTED"
+            )
+            trans = conn.begin()
+            assert_raises_message(
+                tsa.exc.InvalidRequestError,
+                "isolation_level may not be altered",
+                conn.pop_execution_options,
+                frame,
+            )
+            # frame is still in place and effective
+            is_(conn._execution_options_stack[-1], frame)
+            eq_(conn.get_isolation_level(), "READ UNCOMMITTED")
+            trans.rollback()
+            conn.pop_execution_options(frame)
+            eq_(conn.get_isolation_level(), "SERIALIZABLE")
+
+    def test_checkin_with_unpopped_frame_resets_default(self):
+        eng = self._engine()
+        conn = eng.connect()
+        conn.push_execution_options(isolation_level="READ UNCOMMITTED")
+        eq_(conn.get_isolation_level(), "READ UNCOMMITTED")
+        conn.close()
+        conn = eng.connect()
+        eq_(conn.get_isolation_level(), "SERIALIZABLE")
+        conn.close()
+
+    def test_popped_frame_leaves_no_extra_checkin_finalizer(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            conn.execution_options(isolation_level="READ UNCOMMITTED")
+            record = conn.connection._connection_record
+            after_inplace = len(record.finalize_callback)
+            assert after_inplace >= 1
+            with conn.push_execution_options(isolation_level="SERIALIZABLE"):
+                eq_(len(record.finalize_callback), after_inplace + 1)
+            eq_(len(record.finalize_callback), after_inplace)
+
+    def test_invalidate_no_characteristic_replay(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            conn.push_execution_options(
+                isolation_level="READ UNCOMMITTED", custom_option="x"
+            )
+            conn.invalidate()
+            # popping on the invalidated connection does not raise and
+            # does not replay SET on a dead connection
+            conn.pop_execution_options()
+            eq_(conn._execution_options_stack, [])
+            assert "custom_option" not in conn.get_execution_options()
+            # revalidation produces a fresh connection at default level;
+            # the frame is not replayed
+            eq_(conn.get_isolation_level(), "SERIALIZABLE")
+
+    def test_invalidate_revalidate_then_pop_no_replay(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            conn.push_execution_options(
+                isolation_level="READ UNCOMMITTED", custom_option="x"
+            )
+            conn.invalidate()
+            # force revalidation: new DBAPI connection, default level;
+            # the pending frame is not replayed
+            conn.execute(text("SELECT 1")).close()
+            eq_(conn.get_isolation_level(), "SERIALIZABLE")
+
+            # popping after the swap restores the option view without
+            # issuing SET on the replacement connection
+            conn.pop_execution_options()
+            eq_(conn._execution_options_stack, [])
+            eq_(conn.get_isolation_level(), "SERIALIZABLE")
+            assert "custom_option" not in conn.get_execution_options()
+
+    def test_invalidate_with_nested_frames(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            outer = conn.push_execution_options(
+                isolation_level="READ UNCOMMITTED"
+            )
+            inner = conn.push_execution_options(custom_option="x")
+            conn.invalidate()
+            conn.pop_execution_options(inner)
+            conn.pop_execution_options(outer)
+            eq_(conn._execution_options_stack, [])
+            eq_(conn.get_isolation_level(), "SERIALIZABLE")
+
+    def test_pop_after_close_is_tolerated(self):
+        eng = self._engine()
+        conn = eng.connect()
+        frame = conn.push_execution_options(
+            custom_option="x", isolation_level="READ UNCOMMITTED"
+        )
+        conn.close()
+        # no DBAPI replay on a closed connection, no error
+        conn.pop_execution_options(frame)
+        assert "custom_option" not in conn.get_execution_options()
+
+    def test_logging_token_nested(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            assert conn._message_formatter is None
+            with conn.push_execution_options(logging_token="outer"):
+                eq_(conn._message_formatter("x"), "[outer] x")
+                with conn.push_execution_options(logging_token="inner"):
+                    eq_(conn._message_formatter("x"), "[inner] x")
+                eq_(conn._message_formatter("x"), "[outer] x")
+            assert conn._message_formatter is None
+
+    def test_logging_token_restores_outer_during_transaction(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            with conn.push_execution_options(logging_token="t"):
+                conn.execute(text("CREATE TABLE t (id INTEGER)"))  # autobegin
+                # connection-local: allowed even with a transaction
+                conn.pop_execution_options()
+                assert conn._message_formatter is None
+                conn.rollback()
+
+    def test_logging_token_characteristic_has_no_dbapi_path(self):
+        from sqlalchemy.engine.characteristics import (
+            LoggingTokenCharacteristic,
+        )
+
+        characteristic = LoggingTokenCharacteristic()
+        is_true(characteristic.connection_local)
+        # only the connection-side hook exists; the DBAPI hook must not
+        # silently succeed for the logging token
+        assert_raises(
+            NotImplementedError,
+            characteristic.set_characteristic,
+            self._engine().dialect,
+            None,
+            "token",
+        )
+
+    def test_schema_translate_map_live_per_execute(self):
+        eng = self._engine()
+        metadata = MetaData()
+        alt_table = Table(
+            "t", metadata, Column("id", Integer), schema="alt"
+        )
+        statements = []
+
+        @event.listens_for(eng, "before_cursor_execute")
+        def _recv(
+            conn, cursor, statement, parameters, context, executemany
+        ):
+            statements.append(statement)
+
+        with eng.connect() as conn:
+            with conn.begin():
+                conn.execute(text("CREATE TABLE t (id INTEGER)"))
+
+            with conn.push_execution_options(
+                schema_translate_map={"alt": "main"}
+            ):
+                conn.execute(select(alt_table)).close()
+                eq_(conn.schema_for_object(alt_table), "main")
+
+            eq_(conn.schema_for_object(alt_table), "alt")
+
+            def _go():
+                conn.execute(select(alt_table)).close()
+
+            assert_raises(tsa.exc.OperationalError, _go)
+            conn.rollback()
+
+            # pushing again works - the map is not frozen at first execute
+            with conn.push_execution_options(
+                schema_translate_map={"alt": "main"}
+            ):
+                conn.execute(select(alt_table)).close()
+
+        select_statements = [
+            s for s in statements if s.upper().startswith("SELECT")
+        ]
+        eq_(len(select_statements), 3)
+        assert "main.t" in select_statements[0]
+        assert "alt.t" in select_statements[1]
+        assert "main.t" in select_statements[2]
+
+    def test_stream_results_live(self):
+        eng = self._engine()
+        stmt = select(literal(1).label("x"))
+        with eng.connect() as conn:
+            result = conn.execute(stmt)
+            is_false(result.context.execution_options.get("stream_results"))
+            result.close()
+
+            with conn.push_execution_options(stream_results=True):
+                result = conn.execute(stmt)
+                is_true(result.context.execution_options["stream_results"])
+                result.close()
+
+            result = conn.execute(stmt)
+            is_false(result.context.execution_options.get("stream_results"))
+            result.close()
+
+    def test_yield_per_live(self):
+        eng = self._engine()
+        stmt = select(literal(1).label("x"))
+        with eng.connect() as conn:
+            with conn.push_execution_options(yield_per=5):
+                result = conn.execute(stmt)
+                eq_(result._yield_per, 5)
+                is_true(result.context.execution_options["stream_results"])
+                eq_(result.context.execution_options["max_row_buffer"], 5)
+                result.close()
+
+            result = conn.execute(stmt)
+            is_(result._yield_per, None)
+            result.close()
+
+    def test_user_defined_options_layered(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            with conn.push_execution_options(
+                **{"custom.a": 1, "shared": "a"}
+            ):
+                with conn.push_execution_options(
+                    **{"custom.b": 2, "shared": "b"}
+                ):
+                    opts = conn.get_execution_options()
+                    eq_(opts["custom.a"], 1)
+                    eq_(opts["custom.b"], 2)
+                    eq_(opts["shared"], "b")
+                opts = conn.get_execution_options()
+                eq_(opts["custom.a"], 1)
+                assert "custom.b" not in opts
+                eq_(opts["shared"], "a")
+            opts = conn.get_execution_options()
+            assert "custom.a" not in opts
+            assert "shared" not in opts
+
+    def test_inplace_call_within_frame_checkout_scoped_reset(self):
+        eng = self._engine()
+        with eng.connect() as conn:
+            with conn.push_execution_options(custom_option="frame"):
+                # in-place API inside the frame: characteristic change
+                # keeps its checkout-scoped contract and its own pool
+                # finalizer; the popped view is the outer view
+                conn.execution_options(
+                    isolation_level="READ UNCOMMITTED",
+                    inplace_option="z",
+                )
+                eq_(conn.get_isolation_level(), "READ UNCOMMITTED")
+                eq_(
+                    conn.get_execution_options()["inplace_option"], "z"
+                )
+
+            eq_(conn._execution_options_stack, [])
+            assert "custom_option" not in conn.get_execution_options()
+            assert "inplace_option" not in conn.get_execution_options()
+            # the checkout-scoped in-place change is still live until
+            # checkin...
+            eq_(conn.get_isolation_level(), "READ UNCOMMITTED")
+        # ...and the pool reset brings the next checkout to default
+        with eng.connect() as conn:
+            eq_(conn.get_isolation_level(), "SERIALIZABLE")
+
+    def test_set_connection_event_fires_on_push_only(self):
+        eng = self._engine()
+        seen = []
+        with eng.connect() as conn:
+            event.listen(
+                conn,
+                "set_connection_execution_options",
+                lambda conn, opts: seen.append(dict(opts)),
+            )
+            with conn.push_execution_options(
+                isolation_level="READ UNCOMMITTED", custom_option="x"
+            ):
+                pass
+        eq_(
+            seen,
+            [
+                {
+                    "isolation_level": "READ UNCOMMITTED",
+                    "custom_option": "x",
+                }
+            ],
+        )
+
+    def test_engine_option_engine_independent(self):
+        eng = self._engine()
+        conn = eng.connect()
+        try:
+            opt_engine = eng.execution_options(
+                logging_token="tok", custom_engine_option="z"
+            )
+            is_not(opt_engine, eng)
+            is_(opt_engine.pool, eng.pool)
+            # checked-out Connection is untouched
+            assert "custom_engine_option" not in conn.get_execution_options()
+            eq_(conn._execution_options_stack, [])
+        finally:
+            conn.close()
+
+    def test_statement_level_options_keep_merge_behavior(self):
+        # current merge order is: statement -> connection -> per-call,
+        # i.e. connection (stack top) wins over a statement-level option,
+        # while options passed to execute() win over both.  This must
+        # remain unchanged.
+        eng = self._engine()
+        stmt = select(literal(1).label("x")).execution_options(
+            statement_option="stmt", shared="stmt"
+        )
+        with eng.connect() as conn:
+            with conn.push_execution_options(
+                connection_option="conn", shared="conn"
+            ):
+                result = conn.execute(stmt)
+                opts = result.context.execution_options
+                eq_(opts["statement_option"], "stmt")
+                eq_(opts["connection_option"], "conn")
+                # stack top continues to win over statement level
+                eq_(opts["shared"], "conn")
+                result.close()
+
+                result = conn.execute(
+                    stmt, execution_options={"shared": "per_call"}
+                )
+                eq_(
+                    result.context.execution_options["shared"], "per_call"
+                )
+                result.close()

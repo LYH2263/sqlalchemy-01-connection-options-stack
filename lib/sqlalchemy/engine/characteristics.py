@@ -41,6 +41,14 @@ class ConnectionCharacteristic(abc.ABC):
 
     transactional: ClassVar[bool] = False
 
+    #: True for characteristics that are local to the
+    #: :class:`_engine.Connection` object itself and do not emit any state
+    #: change on the DBAPI connection.  Such characteristics are restored
+    #: when an execution-options frame is popped even if the DBAPI
+    #: connection was invalidated in the meantime; DBAPI-bound
+    #: characteristics are deliberately not replayed in that situation.
+    connection_local: ClassVar[bool] = False
+
     @abc.abstractmethod
     def reset_characteristic(
         self, dialect: Dialect, dbapi_conn: DBAPIConnection
@@ -121,6 +129,10 @@ class LoggingTokenCharacteristic(ConnectionCharacteristic):
     """
 
     transactional: ClassVar[bool] = False
+
+    # the logging token only changes Connection-side log message
+    # formatting; no state is ever sent to the DBAPI connection
+    connection_local: ClassVar[bool] = True
 
     def reset_characteristic(
         self, dialect: Dialect, dbapi_conn: DBAPIConnection

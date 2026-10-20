@@ -904,6 +904,49 @@ class SessionTransactionTest(fixtures.RemovesEvents, FixtureTest):
         ):
             sess.connection(execution_options={"isolation_level": "FOO"})
 
+    def test_ignored_session_options_do_not_touch_connection_stack(self):
+        sess = fixture_session()
+        sess.execute(text("select 1"))
+        conn = sess.connection()
+
+        with conn.push_execution_options(custom_option="x"):
+            with expect_warnings(
+                "Connection is already established for the "
+                "given bind; execution_options ignored"
+            ):
+                sess.connection(execution_options={"ignored_option": 1})
+            # stack top is untouched
+            assert "ignored_option" not in conn.get_execution_options()
+            eq_(conn.get_execution_options()["custom_option"], "x")
+            eq_(len(conn._execution_options_stack), 1)
+        eq_(conn._execution_options_stack, [])
+
+    def test_option_stack_cross_nested_with_no_autoflush(self):
+        sess = fixture_session()
+        sess.execute(text("select 1"))
+        conn = sess.connection()
+
+        # no_autoflush outermost, option frame innermost
+        with sess.no_autoflush:
+            is_(sess.autoflush, False)
+            with conn.push_execution_options(custom_option="x"):
+                eq_(conn.get_execution_options()["custom_option"], "x")
+                is_(sess.autoflush, False)
+            assert "custom_option" not in conn.get_execution_options()
+            is_(sess.autoflush, False)
+        is_(sess.autoflush, True)
+        eq_(conn._execution_options_stack, [])
+
+        # option frame outermost, no_autoflush innermost
+        with conn.push_execution_options(custom_option="y"):
+            with sess.no_autoflush:
+                is_(sess.autoflush, False)
+                eq_(conn.get_execution_options()["custom_option"], "y")
+            is_(sess.autoflush, True)
+        is_(sess.autoflush, True)
+        assert "custom_option" not in conn.get_execution_options()
+        eq_(conn._execution_options_stack, [])
+
     def test_warning_on_using_inactive_session_new(self):
         User = self.classes.User
 

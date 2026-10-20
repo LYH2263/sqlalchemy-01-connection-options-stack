@@ -655,16 +655,16 @@ class DefaultDialect(Dialect):
             )
             self._set_connection_characteristics(connection, characteristics)
 
-    def _set_connection_characteristics(self, connection, characteristics):
-        characteristic_values = [
-            (name, self.connection_characteristics[name], value)
-            for name, value in characteristics.items()
-        ]
+    def _assert_no_transactional_characteristics(
+        self, connection, characteristics
+    ):
+        """Raise if any ``(name, characteristic)`` pair is transactional
+        while the connection has a transaction in progress."""
 
         if connection.in_transaction():
             trans_objs = [
                 (name, obj)
-                for name, obj, _ in characteristic_values
+                for name, obj in characteristics
                 if obj.transactional
             ]
             if trans_objs:
@@ -676,6 +676,20 @@ class DefaultDialect(Dialect):
                     % (", ".join(name for name, obj in trans_objs))
                 )
 
+    def _set_connection_characteristics(self, connection, characteristics):
+        characteristic_values = [
+            (name, self.connection_characteristics[name], value)
+            for name, value in characteristics.items()
+        ]
+
+        self._assert_no_transactional_characteristics(
+            connection,
+            [
+                (name, characteristic)
+                for name, characteristic, _ in characteristic_values
+            ],
+        )
+
         dbapi_connection = connection.connection.dbapi_connection
         for _, characteristic, value in characteristic_values:
             characteristic.set_connection_characteristic(
@@ -684,6 +698,129 @@ class DefaultDialect(Dialect):
         connection.connection._connection_record.finalize_callback.append(
             functools.partial(self._reset_characteristics, characteristics)
         )
+
+    def push_connection_execution_options(
+        self, connection, opts, previous_opts
+    ):
+        """Apply the registered characteristics carried by a newly pushed
+        execution-options frame.
+
+        This is the "push" side of the nested execution-options stack used
+        by :meth:`_engine.Connection.push_execution_options`.  It is kept
+        separate from :meth:`.set_connection_execution_options`, which
+        implements the in-place, non-nested behavior:
+
+        1. the transactional guard rejects transactional characteristics
+           (such as ``isolation_level``) while a transaction is in
+           progress, just as with the in-place behavior;
+        2. for each characteristic, the value that has to be restored when
+           the frame is popped is captured *before* setting the new value.
+           If the characteristic name was present in the outer execution
+           options, that declared outer user value is used directly;
+           otherwise the actual current value is read from the connection
+           so that popping restores the exact outer state instead of a
+           dialect or on-connect default;
+        3. the new values are applied through
+           :meth:`.ConnectionCharacteristic.set_connection_characteristic`;
+        4. a unique checkin finalizer is registered so that, should the
+           frame still be present when the DBAPI connection is returned to
+           the pool, the pool's existing checkin path resets these
+           characteristics to the dialect default.  This finalizer is
+           removed again by :meth:`.pop_connection_execution_options` when
+           the frame is popped normally on the same connection.
+
+        Return a tuple of ``(characteristic_restore, checkin_finalizer)``
+        where ``characteristic_restore`` is a list of
+        ``(name, characteristic, outer_value)`` triples applied at pop
+        time.
+        """
+
+        characteristic_values = [
+            (name, self.connection_characteristics[name], opts[name])
+            for name in self.connection_characteristics
+            if name in opts
+        ]
+
+        if not characteristic_values:
+            return [], None
+
+        self._assert_no_transactional_characteristics(
+            connection,
+            [
+                (name, characteristic)
+                for name, characteristic, _ in characteristic_values
+            ],
+        )
+
+        dbapi_connection = connection.connection.dbapi_connection
+
+        characteristic_restore = []
+        reset_characteristics = {}
+        for name, characteristic, value in characteristic_values:
+            if name in previous_opts:
+                outer_value = previous_opts[name]
+            else:
+                outer_value = characteristic.get_connection_characteristic(
+                    self, connection, dbapi_connection
+                )
+            characteristic_restore.append(
+                (name, characteristic, outer_value)
+            )
+            reset_characteristics[name] = value
+
+            characteristic.set_connection_characteristic(
+                self, connection, dbapi_connection, value
+            )
+
+        reset_characteristics = util.immutabledict(reset_characteristics)
+
+        # build a fresh closure per frame so frames that reset the same
+        # characteristic names can be detached individually by identity
+        def checkin_finalizer(dbapi_conn, _reset=self._reset_characteristics):
+            _reset(reset_characteristics, dbapi_conn)
+
+        connection.connection._connection_record.finalize_callback.append(
+            checkin_finalizer
+        )
+
+        return characteristic_restore, checkin_finalizer
+
+    def pop_connection_execution_options(
+        self, connection, characteristic_restore
+    ):
+        """Restore registered characteristics to their outer values when an
+        execution-options frame is popped on the same, still-valid DBAPI
+        connection.
+
+        This is the normal "pop" exit and is intentionally distinct from:
+
+        * the pool checkin exit
+          (:meth:`._reset_characteristics`, which resets to the dialect
+          default), and
+        * the invalidation exit (handled on the
+          :class:`_engine.Connection`, where DBAPI-bound characteristics
+          are not replayed onto a replacement connection).
+
+        """
+        # the transactional constraint is symmetric: restoring a
+        # transactional characteristic also emits statements and may not
+        # happen while a transaction is in progress.  Connection-local
+        # characteristics (e.g. logging_token) do not touch the DBAPI and
+        # are exempt.
+        self._assert_no_transactional_characteristics(
+            connection,
+            [
+                (name, characteristic)
+                for name, characteristic, _ in characteristic_restore
+                if not characteristic.connection_local
+            ],
+        )
+
+        dbapi_connection = connection.connection.dbapi_connection
+        for _, characteristic, outer_value in characteristic_restore:
+            characteristic.set_connection_characteristic(
+                self, connection, dbapi_connection, outer_value
+            )
 
     def _reset_characteristics(self, characteristics, dbapi_connection):
         for characteristic_name in characteristics:

@@ -1554,3 +1554,108 @@ class PoolRegenTest(EngineFixture):
 
         tasks = [thing(engine) for _ in range(10)]
         await asyncio.gather(*tasks)
+
+
+class AsyncExecutionOptionsStackTest(EngineFixture):
+    """Nested execution options stack bridged from AsyncConnection to the
+    proxied synchronous Connection."""
+
+    @async_test
+    async def test_push_pop_uses_single_sync_stack(self, async_engine):
+        async with async_engine.connect() as conn:
+            default = await conn.get_isolation_level()
+
+            frame = await conn.push_execution_options(
+                isolation_level="READ UNCOMMITTED", custom_option="x"
+            )
+            sync_stack = conn.sync_connection._execution_options_stack
+            eq_(len(sync_stack), 1)
+            is_(sync_stack[-1], frame.sync_frame)
+            eq_(await conn.get_isolation_level(), "READ UNCOMMITTED")
+            eq_(
+                conn.sync_connection.get_execution_options()[
+                    "custom_option"
+                ],
+                "x",
+            )
+
+            await conn.pop_execution_options(frame)
+            eq_(sync_stack, [])
+            eq_(await conn.get_isolation_level(), default)
+            assert (
+                "custom_option"
+                not in conn.sync_connection.get_execution_options()
+            )
+
+    @async_test
+    async def test_async_context_manager_pops_on_exception(
+        self, async_engine
+    ):
+        async with async_engine.connect() as conn:
+            default = await conn.get_isolation_level()
+            try:
+                async with await conn.push_execution_options(
+                    isolation_level="READ UNCOMMITTED", custom_option="x"
+                ):
+                    eq_(
+                        await conn.get_isolation_level(),
+                        "READ UNCOMMITTED",
+                    )
+                    raise RuntimeError("boom")
+            except RuntimeError:
+                pass
+            eq_(conn.sync_connection._execution_options_stack, [])
+            eq_(await conn.get_isolation_level(), default)
+            assert (
+                "custom_option"
+                not in conn.sync_connection.get_execution_options()
+            )
+
+    @async_test
+    async def test_nested_frames(self, async_engine):
+        users = self.tables.users
+        async with async_engine.connect() as conn:
+            async with await conn.push_execution_options(custom_option="a"):
+                async with await conn.push_execution_options(
+                    stream_results=True, custom_option="b"
+                ):
+                    opts = conn.sync_connection.get_execution_options()
+                    eq_(opts["custom_option"], "b")
+                    is_true(opts["stream_results"])
+                    # the stacked option affects the actual async fetch
+                    result = await conn.stream(select(users))
+                    await result.close()
+                opts = conn.sync_connection.get_execution_options()
+                eq_(opts["custom_option"], "a")
+                is_false(opts.get("stream_results"))
+            assert (
+                "custom_option"
+                not in conn.sync_connection.get_execution_options()
+            )
+
+    @async_test
+    async def test_pop_empty_and_lifo(self, async_engine):
+        async with async_engine.connect() as conn:
+            with expect_raises_message(
+                exc.InvalidRequestError, "no execution options frame to pop"
+            ):
+                await conn.pop_execution_options()
+
+            outer = await conn.push_execution_options(custom_option="a")
+            inner = await conn.push_execution_options(custom_option="b")
+            with expect_raises_message(
+                exc.InvalidRequestError, "reverse order"
+            ):
+                await conn.pop_execution_options(outer)
+            await conn.pop_execution_options(inner)
+            await conn.pop_execution_options(outer)
+
+    @async_test
+    async def test_unpopped_frame_resets_at_checkin(self, async_engine):
+        async with async_engine.connect() as conn:
+            await conn.push_execution_options(
+                isolation_level="READ UNCOMMITTED"
+            )
+            eq_(await conn.get_isolation_level(), "READ UNCOMMITTED")
+        async with async_engine.connect() as conn:
+            eq_(await conn.get_isolation_level(), "SERIALIZABLE")

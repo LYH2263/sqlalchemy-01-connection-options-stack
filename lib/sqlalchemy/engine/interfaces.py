@@ -2655,6 +2655,40 @@ class Dialect(EventTarget):
         """
         raise NotImplementedError()
 
+    def push_connection_execution_options(
+        self,
+        connection: Connection,
+        opts: CoreExecuteOptionsParameter,
+        previous_opts: CoreExecuteOptionsParameter,
+    ) -> None:
+        """Apply registered connection characteristics for a nested
+        execution-options frame.
+
+        Implemented by :class:`.DefaultDialect` to support
+        :meth:`_engine.Connection.push_execution_options`; see
+        :meth:`.Dialect.set_connection_execution_options` for the
+        equivalent in-place hook.
+
+        """
+        raise NotImplementedError()
+
+    def pop_connection_execution_options(
+        self,
+        connection: Connection,
+        characteristic_restore: Any,
+    ) -> None:
+        """Restore registered connection characteristics to their outer
+        values when a nested execution-options frame is popped.
+
+        Implemented by :class:`.DefaultDialect` to support
+        :meth:`_engine.Connection.pop_execution_options`.  This hook is
+        only invoked while the same DBAPI connection that was active when
+        the frame was pushed is still checked out and valid; the pool
+        checkin reset is handled separately.
+
+        """
+        raise NotImplementedError()
+
     def get_dialect_pool_class(self, url: URL) -> Type[Pool]:
         """return a Pool class to use for a given URL"""
         raise NotImplementedError()
